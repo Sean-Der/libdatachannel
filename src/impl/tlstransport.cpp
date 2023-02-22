@@ -292,7 +292,223 @@ int TlsTransport::TimeoutCallback(gnutls_transport_ptr_t ptr, unsigned int /* ms
 	}
 }
 
-#else // USE_GNUTLS==0
+#elif USE_MBEDTLS
+
+void TlsTransport::Init() {
+	// Nothing to do
+}
+
+void TlsTransport::Cleanup() {
+	// Nothing to do
+}
+
+TlsTransport::TlsTransport(shared_ptr<TcpTransport> lower, optional<string> host,
+                           certificate_ptr certificate, state_callback callback)
+    : Transport(lower, std::move(callback)), mHost(std::move(host)), mIsClient(lower->isActive()),
+      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
+
+	PLOG_DEBUG << "Initializing TLS transport (MbedTLS)";
+
+	mbedtls_entropy_init(&mEntropy);
+	mbedtls_ctr_drbg_init(&mDrbg);
+	mbedtls_ssl_init(&mSsl);
+	mbedtls_ssl_config_init(&mConf);
+	mbedtls_ctr_drbg_set_prediction_resistance(&mDrbg, MBEDTLS_CTR_DRBG_PR_ON);
+
+	try {
+		mbedtls::check(mbedtls_ctr_drbg_seed(&mDrbg, mbedtls_entropy_func, &mEntropy, NULL, 0));
+
+		mbedtls::check(mbedtls_ssl_config_defaults(
+					&mConf, mIsClient ? MBEDTLS_SSL_IS_CLIENT : MBEDTLS_SSL_IS_SERVER,
+					MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT));
+
+		mbedtls_ssl_conf_authmode(&mConf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+		mbedtls_ssl_conf_rng(&mConf, mbedtls_ctr_drbg_random, &mDrbg);
+
+		if (certificate != nullptr) {
+			auto [crt, pk] = certificate->credentials();
+			mbedtls::check(mbedtls_ssl_conf_own_cert(&mConf, crt.get(), pk.get()));
+		}
+
+		mbedtls::check(mbedtls_ssl_setup(&mSsl, &mConf));
+		mbedtls_ssl_set_bio(&mSsl, static_cast<void *>(this), WriteCallback, ReadCallback, NULL);
+	} catch (...) {
+		mbedtls_entropy_free(&mEntropy);
+		mbedtls_ctr_drbg_free(&mDrbg);
+		mbedtls_ssl_free(&mSsl);
+		mbedtls_ssl_config_free(&mConf);
+		throw;
+	}
+}
+
+TlsTransport::~TlsTransport() {
+}
+
+void TlsTransport::start() {
+	PLOG_DEBUG << "Starting TLS transport";
+	registerIncoming();
+	changeState(State::Connecting);
+	enqueueRecv(); // to initiate the handshake
+}
+
+void TlsTransport::stop() {
+	PLOG_DEBUG << "Stopping TLS transport";
+	unregisterIncoming();
+	mIncomingQueue.stop();
+	enqueueRecv();
+}
+
+bool TlsTransport::send(message_ptr message) {
+	if (state() != State::Connected)
+		throw std::runtime_error("TLS is not open");
+
+	if (!message || message->size() == 0)
+		return outgoing(message); // pass through
+
+	PLOG_VERBOSE << "Send size=" << message->size();
+
+	mbedtls::check(mbedtls_ssl_write(&mSsl, (const unsigned char *) message->data(), int(message->size())));
+
+
+	return true;
+
+}
+
+void TlsTransport::incoming(message_ptr message) {
+	if (!message) {
+		mIncomingQueue.stop();
+		enqueueRecv();
+		return;
+	}
+
+	PLOG_VERBOSE << "Incoming size=" << message->size();
+	mIncomingQueue.push(message);
+	enqueueRecv();
+}
+
+bool TlsTransport::outgoing(message_ptr message) { return Transport::outgoing(std::move(message)); }
+
+void TlsTransport::postHandshake() {
+	// Dummy
+}
+
+void TlsTransport::doRecv() {
+	std::lock_guard lock(mRecvMutex);
+	--mPendingRecvCount;
+
+	if (state() != State::Connecting && state() != State::Connected)
+		return;
+
+	try {
+		const size_t bufferSize = 4096;
+		char buffer[bufferSize];
+
+		// Handle handshake if connecting
+		if (state() == State::Connecting) {
+			auto handshakeStatus = mbedtls_ssl_handshake(&mSsl);
+			switch (handshakeStatus) {
+				case 0:
+					break;
+				case MBEDTLS_ERR_SSL_WANT_WRITE:
+				case MBEDTLS_ERR_SSL_WANT_READ:
+				case MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS:
+				case MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS: {
+					auto timeout = milliseconds(100);
+					ThreadPool::Instance().schedule(timeout, [weak_this = weak_from_this()]() {
+						if (auto locked = weak_this.lock())
+							locked->doRecv();
+					});
+					return;
+				}
+				default:
+				mbedtls::check(handshakeStatus);
+			}
+
+			PLOG_INFO << "TLS handshake finished";
+			changeState(State::Connected);
+			postHandshake();
+		}
+
+		if (state() == State::Connected) {
+			while (true) {
+				auto ret = mbedtls_ssl_read(&mSsl, (unsigned char *) buffer, bufferSize);
+				if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+					// Closed
+					PLOG_DEBUG << "TLS connection cleanly closed";
+					break;
+				}
+				switch (ret) {
+					case MBEDTLS_ERR_SSL_WANT_READ:
+					case MBEDTLS_ERR_SSL_WANT_WRITE:
+					case MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS:
+					case MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS:
+					case MBEDTLS_ERR_SSL_CLIENT_RECONNECT:
+						return;
+				}
+				mbedtls::check(ret);
+
+				auto *b = reinterpret_cast<byte *>(buffer);
+				recv(make_message(b, b + ret));
+			}
+		}
+	} catch (const std::exception &e) {
+		PLOG_ERROR << "TLS recv: " << e.what();
+	}
+
+	PLOG_INFO << "TLS closed";
+	changeState(State::Disconnected);
+	recv(nullptr);
+}
+
+int TlsTransport::WriteCallback(void *ctx, const unsigned char *buf, size_t len) {
+	auto *t = static_cast<TlsTransport *>(ctx);
+	auto *b = reinterpret_cast<const byte *>(buf);
+	if (!t->outgoing(make_message(b, b + len))) {
+		return MBEDTLS_ERR_SSL_WANT_READ;
+	}
+
+	return len;
+}
+
+int TlsTransport::ReadCallback(void *ctx, unsigned char *buf, size_t len) {
+	TlsTransport *t = static_cast<TlsTransport *>(ctx);
+	try {
+		message_ptr &message = t->mIncomingMessage;
+		size_t &position = t->mIncomingMessagePosition;
+
+		if (message && position >= message->size())
+			message.reset();
+
+		if (!message) {
+			position = 0;
+			while (auto next = t->mIncomingQueue.pop()) {
+				message = *next;
+				if (message->size() > 0)
+					break;
+				else
+					t->recv(message); // Pass zero-sized messages through
+			}
+		}
+
+		if (message) {
+			size_t available = message->size() - position;
+			ssize_t writeLen = std::min((unsigned long) len, available);
+			std::memcpy(buf, message->data() + position, writeLen);
+			position += len;
+			return len;
+		} else if (t->mIncomingQueue.running()) {
+			return MBEDTLS_ERR_SSL_WANT_READ;;
+		} else {
+			return MBEDTLS_ERR_SSL_CONN_EOF;
+		}
+
+	} catch (const std::exception &e) {
+		PLOG_WARNING << e.what();
+		return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+	}
+}
+
+#else
 
 int TlsTransport::TransportExIndex = -1;
 
