@@ -70,7 +70,35 @@ protected:
 	static ssize_t WriteCallback(gnutls_transport_ptr_t ptr, const void *data, size_t len);
 	static ssize_t ReadCallback(gnutls_transport_ptr_t ptr, void *data, size_t maxlen);
 	static int TimeoutCallback(gnutls_transport_ptr_t ptr, unsigned int ms);
-#else
+
+#elif USE_MBEDTLS
+	std::mutex mSendMutex;
+
+	mbedtls_entropy_context mEntropy;
+	mbedtls_ctr_drbg_context mDrbg;
+	mbedtls_ssl_config mConf;
+	mbedtls_ssl_context mSsl;
+
+	uint32_t fin_ms, int_ms;
+	std::chrono::time_point<std::chrono::system_clock> timerSetAt;
+
+	char masterSecret[48];
+	char randBytes[64];
+	mbedtls_tls_prf_types tlsProfile;
+
+	static int WriteCallback(void *ctx, const unsigned char *buf, size_t len);
+	static int ReadCallback(void *ctx, unsigned char *buf, size_t len);
+	static void ExportKeysCallback(void *p_expkey,
+	                               mbedtls_ssl_key_export_type type,
+	                               const unsigned char *secret,
+	                               size_t secret_len,
+	                               const unsigned char client_random[32],
+	                               const unsigned char server_random[32],
+	                               mbedtls_tls_prf_types tls_prf_type);
+	static void SetTimerCallback(void *ctx, uint32_t int_ms, uint32_t fin_ms);
+	static int GetTimerCallback(void *ctx);
+
+#else // OPENSSL
 	SSL_CTX *mCtx = NULL;
 	SSL *mSsl = NULL;
 	BIO *mInBio, *mOutBio;

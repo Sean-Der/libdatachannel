@@ -17,3 +17,6 @@
 	path = deps/libsrtp
 	url = https://github.com/cisco/libsrtp.git
 	shallow = true
+[submodule "deps/mbedtls"]
+	path = deps/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
