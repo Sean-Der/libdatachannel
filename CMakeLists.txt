@@ -536,5 +536,6 @@ if(NOT NO_EXAMPLES)
 	endif()
 	add_subdirectory(examples/copy-paste)
 	add_subdirectory(examples/copy-paste-capi)
+	add_subdirectory(examples/p2p)
 endif()
 
