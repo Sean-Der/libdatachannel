@@ -47,8 +47,18 @@ void RtcpNackResponder::incoming(message_vector &messages, const message_callbac
 			}
 
 			for (auto sequenceNumber : missingSequenceNumbers) {
-				if (auto optPacket = mStorage->get(sequenceNumber))
+				auto msg = std::string("Got nack ") + std::to_string(sequenceNumber) + " ";
+
+				if (auto optPacket = mStorage->get(sequenceNumber)) {
 					send(make_message(*optPacket.value()));
+					msg += "Good";
+				} else {
+					msg += "Bad";
+				}
+
+				auto *fp = fopen("C:\\Users\\duboisea\\nack.log", "a+");
+				fwrite(msg.data(), 1, msg.size(), fp);
+				fclose(fp);
 			}
 		}
 	}
